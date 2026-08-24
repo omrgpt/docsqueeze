@@ -3,6 +3,19 @@
 All notable changes to docsqueeze are documented here.
 Format follows Keep a Changelog; versioning follows SemVer.
 
+## [1.1.1] - 2026-08-24
+
+### Fixed
+- Token-budget window caps now scale with `--max-tokens`. Previously the
+  head/tail windows carried fixed 300/200-token floors, so a tiny request
+  (e.g. `--max-tokens 250`) could return ~4x the requested budget on
+  small-cap docs. Caps now derive from the budget itself, and when a
+  windowed head consumes the entire allowance the tail is omitted in favor
+  of an elision banner instead of double-spending.
+- Discovered during a 150-scenario real-world user simulation across 31
+  documents (PDF/DOCX/XLSX/PPTX/ODT/EPUB/HTML/RTF/CSV/JSON/JSONL/TOML/
+  INI/EML/IPYNB/SQLite/logs/zip incl. 6 malicious fixtures).
+
 ## [1.1.0] - 2026-08-24
 
 ### Security

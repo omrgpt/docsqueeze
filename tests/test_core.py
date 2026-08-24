@@ -192,8 +192,12 @@ def build_xlsx(sheets: dict[str, list[list[str]]]) -> bytes:
                 cells = []
                 for c_idx, val in enumerate(row, start=1):
                     ref = f"{chr(64+c_idx)}{r_idx}"
-                    if val == "@DATE@1900-01-01":
-                        cells.append(f'<c r="{ref}" s="0"><v>1</v></c>')
+                    if val.startswith("@DATE@"):
+                        try:
+                            serial = float(val[6:])
+                        except ValueError:
+                            serial = 1.0
+                        cells.append(f'<c r="{ref}" s="0"><v>{serial}</v></c>')
                     elif val.startswith("@F=") :
                         cells.append(f'<c r="{ref}"><f>{val[3:]}</f><v>42</v></c>')
                     elif val.startswith("@I:"):
@@ -474,7 +478,7 @@ class TestXlsx(Base):
         xlsx = build_xlsx(
             {
                 "Data": [
-                    ["Alpha", "@I:inline cell", "@DATE@1900-01-01"],
+                    ["Alpha", "@I:inline cell", "@DATE@1"],
                     ["Beta", "@F=SUM(A1:A2)", "7"],
                 ],
                 "Empty": [["only"]],

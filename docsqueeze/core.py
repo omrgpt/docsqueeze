@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import quote as url_quote
 
-VERSION = "1.1.0"
+VERSION = "1.1.1"
 PROG = "docsqueeze"
 
 EXIT_OK = 0
@@ -295,11 +295,17 @@ def build_output(
         used += cost
         head_idx.append(i)
 
+    # Window caps scale with the budget so tiny budgets stay tiny; the old
+    # fixed 300-token floors could exceed a small --max-tokens by 4x.
+    head_win_cap = max(head_budget, min(300, budget_tokens))
+    tail_allow = min(tail_budget, max(budget_tokens - used, 0))
+    tail_win_cap = max(min(tail_allow, tail_budget) or 0, min(300, budget_tokens))
+
     tail_idx_rev: list[int] = []
     used_tail = 0
     for i in range(len(sections) - 1, len(head_idx) - 1, -1):
         cost = estimate_tokens(sections[i].body)
-        if used_tail + cost > tail_budget:
+        if used_tail + cost > tail_allow:
             break
         used_tail += cost
         tail_idx_rev.append(i)
@@ -328,20 +334,27 @@ def build_output(
         for i in head_idx:
             emit(i)
         head_boundary = head_idx[-1]
+        head_used_tokens = used
     else:
         s = sections[0]
-        blocks.extend([s.anchor, _window_body(s.body, max(head_budget, 300))])
+        blocks.extend([s.anchor, _window_body(s.body, head_win_cap)])
         head_boundary = 0
+        head_used_tokens = head_win_cap
 
     tail_windowed = False
+    tail_omitted = False
     tail_boundary: int
     if tail_idx:
         tail_boundary = tail_idx[0]
-    elif len(sections) - 1 > head_boundary:
+    elif len(sections) - 1 > head_boundary and (tail_allow > 0 or not head_idx):
         tail_boundary = len(sections) - 1
         tail_windowed = True
     else:
-        tail_boundary = head_boundary
+        if len(sections) - 1 > head_boundary:
+            tail_omitted = True
+            tail_boundary = len(sections) - 1
+        else:
+            tail_boundary = head_boundary
 
     mid_lo = head_boundary + 1
     mid_hi = tail_boundary - 1
@@ -361,7 +374,7 @@ def build_output(
             emit(i)
     elif tail_windowed:
         s = sections[-1]
-        blocks.extend([s.anchor, _window_body(s.body, max(tail_budget, 300))])
+        blocks.extend([s.anchor, _window_body(s.body, max(tail_win_cap, 200))])
 
     text = "\n".join(header_lines + blocks)
     emitted = (len(head_idx) if head_idx else 1) + (
