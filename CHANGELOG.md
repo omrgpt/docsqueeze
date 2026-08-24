@@ -3,6 +3,34 @@
 All notable changes to docsqueeze are documented here.
 Format follows Keep a Changelog; versioning follows SemVer.
 
+## [1.2.0] - 2026-08-24
+
+### Security
+- **Zip-bomb caps now run before any decompression.** The eager
+  `ZipFile.testzip()` pass (which decompressed every member before the size/
+  ratio caps could apply) is removed. Metadata checks — entry count,
+  declared sizes, aggregate cap, ratio, names, symlinks — touch only the
+  central directory; CRC integrity is verified per-member by `zipfile`
+  during each budgeted read, failing closed with `SecurityError`.
+  Timing-bounded regression test added.
+- **PDF page cap now applies to optional accelerators.** pypdf/PyMuPDF page
+  loops iterate only up to `MAX_PDF_PAGES` (excess pages reported via
+  `pages_truncated_to_cap` / `pdf_total_pages`). Previously a 100k-page PDF
+  was fully processed when an accelerator was installed. Regression test
+  with a patched 25-page cap over a 120-page fixture.
+- **Stdlib engine is now the default.** `DOCSQUEEZE_ENGINE` defaults to
+  `builtin`; native accelerators (pypdf/PyMuPDF) are opt-in via `auto`,
+  keeping the trusted-computing base at Python's standard library unless
+  explicitly widened.
+- Every output now ends with an explicit UNTRUSTED-DATA footer and
+  `untrusted_notice` metadata, framing extracted text as data rather than
+  instructions (prompt-injection mitigation; see SECURITY.md limitations).
+
+### Changed
+- The opencode skill and plugin are now shipped inside the repo under
+  `integrations/`; `tools/sync_skill.py` installs from the repo as the
+  canonical source and can also install the plugin (`--plugin-to`).
+
 ## [1.1.1] - 2026-08-24
 
 ### Fixed

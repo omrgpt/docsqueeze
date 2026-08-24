@@ -197,8 +197,9 @@ def main() -> int:
     ap.add_argument("--docx-paras", type=int, default=400)
     ap.add_argument("--xlsx-rows", type=int, default=5000)
     ap.add_argument("--real", default=None, help="benchmark a real file on disk")
-    ap.add_argument("--builtin-pdf", action="store_true",
-                    help="add a builtin-engine row for the synthetic PDF")
+    ap.add_argument("--accel-pdf", action="store_true",
+                    help="add a pypdf-accelerated row for the synthetic PDF "
+                         "(default runs are stdlib-builtin since v1.2.0)")
     args = ap.parse_args()
 
     rows: list[dict[str, object]] = []
@@ -209,10 +210,10 @@ def main() -> int:
         pdf_path.write_bytes(make_pdf(args.pdf_pages))
         rows.append(measure(pdf_path, f"synthetic PDF ({args.pdf_pages} pages)", pdf_pages=args.pdf_pages))
 
-        if args.builtin_pdf:
-            os.environ["DOCSQUEEZE_ENGINE"] = "builtin"
+        if args.accel_pdf:
+            os.environ["DOCSQUEEZE_ENGINE"] = "auto"
             try:
-                rows.append(measure(pdf_path, f"same PDF, stdlib engine only", pdf_pages=args.pdf_pages))
+                rows.append(measure(pdf_path, "same PDF, pypdf accelerator", pdf_pages=args.pdf_pages))
             finally:
                 os.environ.pop("DOCSQUEEZE_ENGINE", None)
 

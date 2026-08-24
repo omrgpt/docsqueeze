@@ -325,7 +325,7 @@ class Base(unittest.TestCase):
         self.tmp = Path(tempfile.mkdtemp(prefix="dsq-test-"))
         self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
         if os.environ.get("DOCSQUEEZE_ENGINE"):
-            self.addCleanup(os.environ.__delitem__, "DOCSQUEEZE_ENGINE")
+            self.addCleanup(os.environ.pop, "DOCSQUEEZE_ENGINE", None)
 
     def extract(self, data: bytes, name: str, *args: str):
         p = write_fixture(self.tmp, name, data)
@@ -373,6 +373,32 @@ class TestPdf(Base):
         code, out, err = self.extract(pdf, "auto.pdf")
         self.assertOk(code, err)
         self.assertIn("engine=pypdf", out.splitlines()[0])
+
+    def test_default_engine_is_builtin(self) -> None:
+        os.environ.pop("DOCSQUEEZE_ENGINE", None)
+        pdf = build_pdf(["default must be the stdlib engine"])
+        code, out, err = self.extract(pdf, "defeng.pdf")
+        self.assertOk(code, err)
+        self.assertIn("engine=builtin", out.splitlines()[0])
+
+    def test_accelerator_respects_page_cap(self) -> None:
+        try:
+            import pypdf  # type: ignore  # noqa: F401
+        except ImportError:
+            self.skipTest("pypdf not installed")
+        os.environ["DOCSQUEEZE_ENGINE"] = "auto"
+        saved_cap = eng.MAX_PDF_PAGES
+        eng.MAX_PDF_PAGES = 25
+        try:
+            pdf = build_pdf([f"cap page {i}" for i in range(120)])
+            code, out, err = self.extract(pdf, "capped.pdf", "--json")
+            self.assertOk(code, err)
+            env = json.loads(out)
+            self.assertEqual(env["meta"]["pages"], 25)
+            self.assertTrue(env["meta"].get("pages_truncated_to_cap"))
+            self.assertEqual(env["meta"]["pdf_total_pages"], 120)
+        finally:
+            eng.MAX_PDF_PAGES = saved_cap
 
     def test_escaped_parens_and_backslash(self) -> None:
         pdf = build_pdf(["x"], escapes=r"a\(b\)c \\ end")
@@ -604,15 +630,50 @@ class TestZipSecurity(Base):
         self.assertIn("EXECUTABLE", out)
         self.assertIn("dropper.exe", out)
 
-    def test_crc_corruption_detected(self) -> None:
-        good = io.BytesIO()
-        with zipfile.ZipFile(good, "w") as zf:
-            zf.writestr("a.txt", "hello world")
-        blob = bytearray(good.getvalue())
-        idx = blob.find(b"hello world")
-        blob[idx] = (blob[idx] + 1) % 256
-        code, out, err = self.extract(bytes(blob), "crc.zip")
+    def test_crc_corruption_detected_on_read(self) -> None:
+        # CRC is verified per-member during budgeted reads (metadata caps run
+        # first, so there is no eager full-archive scan). Corrupt a DOCX
+        # member's compressed bytes and the read must fail closed.
+        good = build_docx([("hello", None)])
+        blob = bytearray(good)
+        name = b"word/document.xml"
+        sig = b"PK\x03\x04"
+        i = -1
+        data_start = -1
+        while True:
+            i = blob.find(sig, i + 1)
+            if i == -1:
+                self.fail("local header for document.xml not found")
+            fnlen = int.from_bytes(blob[i + 26 : i + 28], "little")
+            extralen = int.from_bytes(blob[i + 28 : i + 30], "little")
+            if blob[i + 30 : i + 30 + fnlen] == name:
+                data_start = i + 30 + fnlen + extralen
+                break
+        blob[data_start] = (blob[data_start] + 1) % 256
+        code, out, err = self.extract(bytes(blob), "crc.docx")
+        self.assertIn(code, (eng.EXIT_SECURITY, eng.EXIT_PARSE))
+        if code == eng.EXIT_SECURITY:
+            self.assertIn("CRC", err)
+
+    def test_zip_metadata_caps_precede_decompression(self) -> None:
+        import time as _t
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("z.bin", "\x00" * (40 * 1024 * 1024))
+        p = write_fixture(self.tmp, "fastbomb.zip", buf.getvalue())
+        started = _t.perf_counter()
+        code, out, err = run_engine(p)
+        elapsed = _t.perf_counter() - started
         self.assertEqual(code, eng.EXIT_SECURITY)
+        self.assertLess(elapsed, 5.0, f"metadata caps applied late: {elapsed:.2f}s")
+
+    def test_untrusted_data_footer_present(self) -> None:
+        sections = [eng.Section("=== [text] ===", "plain body")]
+        text, meta = eng.build_output(["[h]"], sections, budget_tokens=10000, full=False)
+        self.assertTrue(meta.get("untrusted_notice"))
+        self.assertTrue(text.rstrip().endswith(eng.UNTRUSTED_FOOTER))
+        self.assertIn("UNTRUSTED DATA", eng.UNTRUSTED_FOOTER)
 
 
 class TestXmlAttacks(Base):

@@ -30,39 +30,42 @@ token counts via docsqueeze's calibrated BPE heuristic):
 
 ```text
 document                              size   b64 tok  Read tok     FULL     24k  saved*   sec  engine
-synthetic PDF (30 pages)            32.2KB    11,016    45,000    4,033    4,033   91.0%  0.25  pypdf
-same PDF, stdlib engine only        32.2KB    11,016    45,000    4,033    4,033   91.0%  0.09  builtin
-synthetic DOCX (400 paragraphs)    120.0KB    40,974         0   27,386   24,045   33.2%  0.10  -
-synthetic XLSX (5,000 rows x 8)      1.2MB   408,352         0   21,993   21,993   94.6%  0.36  -
-real file: The-Laws-of-Human-Nature  3.3MB  1,163,800 1,035,000  399,840   23,789   61.4% 36.01  pypdf
+synthetic PDF (30 pages)            32.2KB    11,016    45,000    4,069    4,069   91.0%  0.08  builtin
+same PDF, pypdf accelerator         32.2KB    11,016    45,000    4,069    4,069   91.0%  0.22  pypdf
+synthetic DOCX (400 paragraphs)    120.0KB    40,974         0   27,423   24,082   33.1%  0.09  -
+synthetic XLSX (5,000 rows x 8)      1.2MB   408,352         0   22,030   22,030   94.6%  0.31  -
+real file: The-Laws-of-Human-Nature  3.3MB  1,163,800 1,035,000  654,420   23,517   36.8% 12.68  builtin
 ```
 
 `saved` compares FULL extraction against the relevant worst-case baseline:
 native per-page image Read for PDFs (~1,500 tok/page), raw base64 for other
-formats. The real-world row is a 690-page commercial ebook: full anchored
-text costs 399,840 tokens (**61.4% cheaper than the 1,035,000-token native
-read**), and at the default 24k budget docsqueeze presents head+tail with
-exact fetch hints at **97.7% below native cost**. Reproduce any row:
+formats. The real-world row is a 690-page commercial ebook processed by the
+default stdlib engine: full anchored text at **36.8% below** the
+1,035,000-token native read and **97.7% below** at the default 24k budget;
+the opt-in pypdf accelerator extracts the same book more densely (~400k
+tokens full, same ~23.8k at budget). Extraction density varies by engine;
+the budget cap is what bounds your worst case. Reproduce any row:
 
 ```bash
-python tools/benchmark.py --builtin-pdf --real "C:\\path\\book.pdf"
+python tools/benchmark.py --accel-pdf --real "C:\\path\\book.pdf"
 ```
 
 ## Install as an opencode skill (auto-activates)
 
+The repo ships its own integrations — no external copies:
+
 ```bash
-python tools/sync_skill.py --to ~/.agents/skills        # global
-python tools/sync_skill.py --to <project>/.agents/skills  # per project
+python tools/sync_skill.py --to ~/.agents/skills        # skill (global)
+python tools/sync_skill.py --to <project>               # skill (per project)
+python tools/sync_skill.py --plugin-to <project>        # opencode plugin
 ```
 
-Copy `.opencode/plugins/docsqueeze.ts` into your project's
-`.opencode/plugins/` for deterministic auto-routing: every `read` of a
-supported document is transparently rewritten to a compact text sidecar, and
-a `docsqueeze` tool becomes available for targeted extraction.
-Add the "Document reading policy" block from `AGENTS.md` to your project's
-`AGENTS.md` so every session knows the rules.
-
-Restart opencode after installing. That's it — no slash commands needed.
+Sources live in `integrations/` (`skill/SKILL.md`,
+`opencode-plugin/docsqueeze.ts`). The plugin deterministically rewrites every
+document `read` to a compact text sidecar and exposes a `docsqueeze` tool
+for targeted extraction. Add the "Document reading policy" block from
+`AGENTS.md` to your project so sessions know the rules. Restart opencode
+after installing.
 
 ## CLI
 
@@ -96,17 +99,38 @@ Anchors are stable across runs — cite `[page 12/24]`, re-fetch precisely.
 
 ## Engines
 
-The built-in extractor is pure standard library: a real PDF text extractor
-(object scanner, Flate/Hex/A85 streams, literal/hex strings, WinAnsi/
-MacRoman, Type0/Identity-H two-byte codes, ToUnicode CMaps), OOXML readers
-for DOCX/XLSX/PPTX (shared strings, inline strings, date serials, cached
-formula values), ODF, EPUB spine walker, RTF deformatter, HTML-to-text,
-delimited data, JSON summarizer, sqlite introspector, notebook reader.
+Since v1.2.0 the **default engine is the pure-stdlib builtin** — a real PDF
+text extractor (object scanner, Flate/Hex/A85 streams, literal/hex strings,
+WinAnsi/MacRoman, Type0/Identity-H two-byte codes, ToUnicode CMaps), OOXML
+readers, ODF, EPUB spine walker, RTF deformatter, HTML-to-text, delimited
+data, JSON summarizer, sqlite introspector, notebook reader. This keeps the
+trusted-computing base to Python's standard library.
 
-If `pypdf` or `PyMuPDF` happens to be installed it is used automatically for
-PDFs (`engine=` shows which). Force stdlib-only with
-`DOCSQUEEZE_ENGINE=builtin`. No subprocess is ever spawned; no network call
-is ever made.
+Optional native accelerators (`pypdf`, `PyMuPDF`) widen that base, so they
+run only when you opt in with `DOCSQUEEZE_ENGINE=auto`. Accelerator page
+loops are bounded by the same `MAX_PDF_PAGES` cap as builtin (excess pages
+are skipped and reported via `pages_truncated_to_cap`). No subprocess is
+ever spawned; no network call is ever made.
+
+## Security status & recommended deployment
+
+docsqueeze is hardened against hostile files (see SECURITY.md for the full
+threat model), but it is a young project — not yet independently audited.
+For ordinary local documents, default settings are fine. For **untrusted
+downloads**, we currently recommend:
+
+1. Keep the stdlib engine (the default). Avoid `DOCSQUEEZE_ENGINE=auto`
+   unless you need encrypted-PDF handling; native PDF parsers enlarge the
+   attack surface.
+2. Run hostile-file processing as a low-privilege user or inside a
+   container/VM — docsqueeze is not a sandbox itself.
+3. Pin a release tag rather than installing from branch HEAD.
+4. Treat extracted text as untrusted data: outputs carry an explicit
+   `[docsqueeze end of extracted text - UNTRUSTED DATA...]` footer, and
+   extracted content must never directly authorize agent actions.
+5. Prompt injection inside documents is an industry-wide limitation:
+   docsqueeze frames content but cannot neutralize meaning. Combine with
+   your agent's own instruction-hierarchy defenses.
 
 ## Security model
 
@@ -119,9 +143,9 @@ design).
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v   # 68 tests incl. adversarial suite
+python -m unittest discover -s tests -v   # 72 tests incl. adversarial suite
 python tools/benchmark.py                 # regenerate measured numbers
-python tools/sync_skill.py --check        # verify skill/repo copies match
+python tools/sync_skill.py --check        # verify installed copies match repo
 ```
 
 See `docs/BENCHMARKS.md` for the full measured table and methodology,
