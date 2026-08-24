@@ -1,5 +1,10 @@
 # docsqueeze
 
+[![CI](https://github.com/omrgpt/docsqueeze/actions/workflows/ci.yml/badge.svg)](https://github.com/omrgpt/docsqueeze/actions/workflows/ci.yml)
+![Python](https://img.shields.io/badge/python-3.10%20%7C%203.11%20%7C%203.12-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+![Dependencies](https://img.shields.io/badge/dependencies-zero-brightgreen)
+
 **Token-efficient universal document reader for AI coding agents.**
 
 One auditable, zero-dependency Python script that turns heavy documents —
