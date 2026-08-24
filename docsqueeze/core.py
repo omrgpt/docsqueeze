@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 """docsqueeze - token-efficient universal document reader for AI agents.
 
 Converts heavy documents (PDF, DOCX, XLSX, PPTX, ODT, ODS, ODP, EPUB, RTF,
@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import quote as url_quote
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 PROG = "docsqueeze"
 
 EXIT_OK = 0
@@ -237,11 +237,14 @@ class Section:
 
 
 def _window_body(body: str, token_cap: int) -> str:
-    approx_chars = max(token_cap, 100) * 4
+    token_cap = max(token_cap, 100)
+    density = estimate_tokens(body[:65536]) / max(len(body[:65536]), 1)
+    chars_per_token = 1.0 / max(density, 0.02)
+    approx_chars = int(token_cap * min(chars_per_token, 8.0))
     if len(body) <= approx_chars:
         return body
-    head_chars = int(approx_chars * HEAD_FRACTION)
-    tail_chars = approx_chars - head_chars
+    head_chars = max(int(approx_chars * HEAD_FRACTION), 1)
+    tail_chars = max(approx_chars - head_chars, 0)
     elided = len(body) - head_chars - tail_chars
     return (
         body[:head_chars]
@@ -331,13 +334,10 @@ def build_output(
         head_boundary = 0
 
     tail_windowed = False
+    tail_boundary: int
     if tail_idx:
-        for i in tail_idx:
-            emit(i)
         tail_boundary = tail_idx[0]
     elif len(sections) - 1 > head_boundary:
-        s = sections[-1]
-        blocks.extend([s.anchor, _window_body(s.body, max(tail_budget, 300))])
         tail_boundary = len(sections) - 1
         tail_windowed = True
     else:
@@ -355,6 +355,13 @@ def build_output(
             f"[[docsqueeze elided {mid_count} section(s) ({first_mid.anchor} .. {last_mid.anchor}, "
             f"~{mid_tokens:,} tokens). Fetch them with: docsqueeze <file> {hint}]]"
         )
+
+    if tail_idx:
+        for i in tail_idx:
+            emit(i)
+    elif tail_windowed:
+        s = sections[-1]
+        blocks.extend([s.anchor, _window_body(s.body, max(tail_budget, 300))])
 
     text = "\n".join(header_lines + blocks)
     emitted = (len(head_idx) if head_idx else 1) + (
@@ -441,7 +448,7 @@ def sniff_format(path: Path, data: bytes, declared_ext: str) -> str:
         return "image-webp"
     if data.startswith(b"\x1f\x8b"):
         return "gzip"
-    lower_head = data[:8192].lower()
+    lower_head = data[:262144].lower()
     stripped = data.lstrip()
     if stripped.startswith((b"<?xml", b"<svg")) or (stripped.startswith(b"<") and b"<html" not in lower_head):
         return "xml"
@@ -461,12 +468,8 @@ def sniff_format(path: Path, data: bytes, declared_ext: str) -> str:
         return "toml"
     if declared_ext in (".ini", ".cfg", ".conf"):
         return "ini"
-    if declared_ext == ".eml":
-        return "eml"
     if declared_ext == ".msg":
         return "ole-legacy"
-    if declared_ext == ".ipynb":
-        return "ipynb"
     if declared_ext in (".csv", ".tsv"):
         return "delimited"
     if declared_ext in (".yaml", ".yml"):
@@ -565,16 +568,21 @@ def safe_read_member(zf, info, budget_box: dict[str, int], part_cap: int) -> byt
     return data
 
 
+def _zip_head(zf, name: str, limit: int) -> bytes:
+    import zipfile
+
+    try:
+        with zf.open(name, "r") as fh:
+            return fh.read(limit)
+    except (KeyError, zipfile.BadZipFile, OSError):
+        return b""
+
+
 def detect_office_kind(zf) -> str:
     names = set(zf.namelist())
     kind = ""
     if "[Content_Types].xml" in names:
-        try:
-            ct = zf.read("[Content_Todes].xml".replace("Todes", "Types"))[:65536].decode(
-                "utf-8", errors="replace"
-            )
-        except Exception:
-            ct = ""
+        ct = _zip_head(zf, "[Content_Types].xml", 65536).decode("utf-8", errors="replace")
         if "wordprocessingml.document" in ct:
             kind = "docx"
         elif "spreadsheetml.sheet" in ct:
@@ -582,10 +590,7 @@ def detect_office_kind(zf) -> str:
         elif "presentationml.presentation" in ct:
             kind = "pptx"
     if not kind and "mimetype" in names:
-        try:
-            mt = zf.read("mimetype")[:256].decode("utf-8", errors="replace").strip().lower()
-        except Exception:
-            mt = ""
+        mt = _zip_head(zf, "mimetype", 256).decode("utf-8", errors="replace").strip().lower()
         if "opendocument.text" in mt:
             kind = "odt"
         elif "opendocument.spreadsheet" in mt:
@@ -615,10 +620,53 @@ def detect_office_kind(zf) -> str:
 # recursion bombs in downstream walkers.
 # ---------------------------------------------------------------------------
 
-_DTD_RE = re.compile(
-    rb"<!\[CDATA\[.*?\]\]>|<!DOCTYPE[^>\[](?:>|\s|$)|<!DOCTYPE[^>]*\[[^>]*\]\s*>|<!ENTITY[^>]*>",
-    re.DOTALL,
-)
+_DTD_OPEN_RE = re.compile(rb"<!DOCTYPE")
+
+
+def _strip_doctype_linear(data: bytes) -> bytes:
+    """Remove DOCTYPE declarations with a single-pass scanner.
+
+    A regex like <!DOCTYPE.*?\\[.*?\\]> is quadratic on adversarial input
+    (many unterminated declarations), so we locate each declaration and scan
+    forward once, tracking quote state and the internal-subset bracket depth.
+    """
+    out = bytearray()
+    pos = 0
+    n = len(data)
+    while True:
+        m = _DTD_OPEN_RE.search(data, pos)
+        if m is None:
+            out += data[pos:]
+            break
+        start = m.start()
+        out += data[pos:start]
+        i = m.end()
+        quote: int | None = None
+        depth = 0
+        closed = False
+        while i < n:
+            c = data[i]
+            if quote is not None:
+                if c == quote:
+                    quote = None
+            elif c in (0x22, 0x27):
+                quote = c
+            elif c == 0x5B:  # '['
+                depth += 1
+            elif c == 0x5D:  # ']'
+                if depth > 0:
+                    depth -= 1
+            elif c == 0x3E and depth == 0:  # '>'
+                i += 1
+                closed = True
+                break
+            i += 1
+        if not closed:
+            break
+        pos = i
+    return bytes(out)
+
+
 _TAG_OPEN_RE = re.compile(rb"<[A-Za-z_!?/]")
 
 
@@ -665,13 +713,11 @@ def _xml_depth_heuristic(data: bytes) -> int:
 def parse_xml_safe(data: bytes):
     import xml.etree.ElementTree as ET
 
-    if b"<!DOCTYPE" in data[:1_048_576] or b"<!ENTITY" in data[:1_048_576]:
-        def _keep_cdata(match: re.Match) -> bytes:
-            chunk = match.group(0)
-            return chunk if chunk.startswith(b"<![CDATA[") else b""
-
-        data = _DTD_RE.sub(_keep_cdata, data)
-        data = re.sub(rb"&(?!(?:amp|lt|gt|quot|apos);)", b"&amp;", data)
+    if b"<!DOCTYPE" in data[:1_048_576]:
+        data = _strip_doctype_linear(data)
+    data = re.sub(
+        rb"&(?!(?:amp|lt|gt|quot|apos|#\d+|#x[0-9A-Fa-f]+);)", b"&amp;", data
+    )
     if len(data) > MAX_XML_PART_BYTES:
         raise SecurityError(
             f"XML part exceeds {human_size(MAX_XML_PART_BYTES)} cap"
@@ -919,16 +965,36 @@ def parse_tounicode_cmap(data: bytes) -> dict[int, str]:
         except (ValueError, binascii.Error):
             return ""
 
-    for block in re.finditer(r"beginbfchar(.*?)endbfchar", text, re.DOTALL):
-        for pair in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", block.group(1)):
+    def bounded_blocks(marker: str) -> list[str]:
+        """Locate begin<marker>...end<marker> blocks in linear time.
+
+        A lazy-DOTALL finditer is quadratic when an attacker sprinkles
+        'begin' markers with no terminator, so we advance by index.
+        """
+        blocks: list[str] = []
+        search_from = 0
+        begin_tok = "begin" + marker
+        end_tok = "end" + marker
+        while len(blocks) < 64:
+            b = text.find(begin_tok, search_from)
+            if b == -1:
+                break
+            e = text.find(end_tok, b + len(begin_tok))
+            if e == -1:
+                break
+            blocks.append(text[b + len(begin_tok) : e])
+            search_from = e + len(end_tok)
+        return blocks
+
+    for body in bounded_blocks("bfchar"):
+        for pair in re.finditer(r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]*)>", body):
             try:
                 src = int(pair.group(1), 16)
             except ValueError:
                 continue
             mapping[src] = dst_of(pair.group(2))
 
-    for block in re.finditer(r"beginbfrange(.*?)endbfrange", text, re.DOTALL):
-        body = block.group(1)
+    for body in bounded_blocks("bfrange"):
         for rng in re.finditer(
             r"<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>\s*<([0-9A-Fa-f]+)>", body
         ):
@@ -2345,10 +2411,13 @@ def rtf_to_text(src: str) -> str:
 # ---------------------------------------------------------------------------
 
 _FORMULA_CELL_RE = re.compile(r"^\s*[=+@]")
+_DANGEROUS_MINUS_RE = re.compile(r"^\s*-\s*[\D]|^\s*-\d*\s*[|&;()`]")
 
 
 def _flag_csv_cell(cell: str) -> str:
     if _FORMULA_CELL_RE.match(cell):
+        return f"'{cell}[FORMULA?]"
+    if _DANGEROUS_MINUS_RE.match(cell) and not re.fullmatch(r"\s*-\d+(\.\d+)?%?", cell):
         return f"'{cell}[FORMULA?]"
     return cell
 

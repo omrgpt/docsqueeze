@@ -20,19 +20,28 @@ as images) and than existing converter tools:
 | Network access | n/a | some paths fetch URLs | **none. ever.** |
 | Supply-chain surface | n/a | large transitive deps | **one file you can read in an afternoon** |
 
-Measured with `tools/benchmark.py` on this machine:
+Measured locally with `tools/benchmark.py` (Python 3.12, Windows;
+token counts via docsqueeze's calibrated BPE heuristic):
 
 ```text
-document                    raw size   b64 tokens  native Read    dsq FULL  dsq BUDGET   saved
-PDF  (30 pages)              32.4KB       11,082       45,000      13,160      13,160   70.8% vs Read
-DOCX (400 paragraphs)       120.0KB       40,970            0      27,386      24,046   33.2% vs b64
-XLSX (5,000 rows x 8)         1.2MB      408,336            0      21,993      21,993   94.6% vs b64
+document                              size   b64 tok  Read tok     FULL     24k  saved*   sec  engine
+synthetic PDF (30 pages)            32.2KB    11,016    45,000    4,033    4,033   91.0%  0.25  pypdf
+same PDF, stdlib engine only        32.2KB    11,016    45,000    4,033    4,033   91.0%  0.09  builtin
+synthetic DOCX (400 paragraphs)    120.0KB    40,974         0   27,386   24,045   33.2%  0.10  -
+synthetic XLSX (5,000 rows x 8)      1.2MB   408,352         0   21,993   21,993   94.6%  0.36  -
+real file: The-Laws-of-Human-Nature  3.3MB  1,163,800 1,035,000  399,840   23,789   61.4% 36.01  pypdf
 ```
 
-A real-world run: a **690-page** commercial ebook extracted to full anchored
-text (~400k tokens, still 61% cheaper than the >1M-token native read) in
-~34s; at the default budget it presents the first/last sections plus exact
-re-fetch hints for ~24k tokens total.
+`saved` compares FULL extraction against the relevant worst-case baseline:
+native per-page image Read for PDFs (~1,500 tok/page), raw base64 for other
+formats. The real-world row is a 690-page commercial ebook: full anchored
+text costs 399,840 tokens (**61.4% cheaper than the 1,035,000-token native
+read**), and at the default 24k budget docsqueeze presents head+tail with
+exact fetch hints at **97.7% below native cost**. Reproduce any row:
+
+```bash
+python tools/benchmark.py --builtin-pdf --real "C:\\path\\book.pdf"
+```
 
 ## Install as an opencode skill (auto-activates)
 
@@ -69,7 +78,7 @@ Exit codes: `0` ok · `2` usage · `3` unsupported · `4` security block ·
 ### Output contract
 
 ```
-[docsqueeze v1.0.0] file=report.pdf size=2.1MB format=pdf pages=24 engine=pypdf time=0.41s
+[docsqueeze v1.1.0] file=report.pdf size=2.1MB format=pdf pages=24 engine=pypdf time=0.41s
 === [page 1/24] ===
 ...
 [[docsqueeze elided 14 section(s) (=== [page 6/24] === .. === [page 19/24] ===, ~9,412 tokens).
@@ -105,10 +114,18 @@ design).
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v   # 55 tests incl. adversarial suite
+python -m unittest discover -s tests -v   # 68 tests incl. adversarial suite
 python tools/benchmark.py                 # regenerate measured numbers
 python tools/sync_skill.py --check        # verify skill/repo copies match
 ```
+
+See `docs/BENCHMARKS.md` for the full measured table and methodology,
+`CHANGELOG.md` for release history, `CONTRIBUTING.md` to hack on docsqueeze.
+
+## Security disclosure
+
+Found a bypass (ReDoS, bomb, traversal, injection)? See `SECURITY.md`
+for the threat model and responsible-disclosure notes.
 
 ## License
 

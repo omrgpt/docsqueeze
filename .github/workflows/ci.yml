@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+        python-version: ["3.10", "3.11", "3.12"]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Run full test suite (stdlib only)
+        run: python -m unittest discover -s tests -v
+      - name: Verify skill/repo engine copies are in sync
+        run: python tools/sync_skill.py --check
+        continue-on-error: true
+      - name: Benchmark smoke (small)
+        run: python tools/benchmark.py --pdf-pages 3 --docx-paras 20 --xlsx-rows 50
+
+  security-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Adversarial fixtures must be blocked with exit code 4
+        run: |
+          python - <<'PY'
+          import io, sys, zipfile, subprocess, tempfile, os
+          sys.path.insert(0, ".")
+          from pathlib import Path
+          import docsqueeze.core as eng
+          tmp = Path(tempfile.mkdtemp())
+          def run(data, name):
+              p = tmp / name; p.write_bytes(data)
+              r = subprocess.run([sys.executable, "-c",
+                  "import sys; import docsqueeze.core as c; sys.exit(c.main())",
+                  str(p)], capture_output=True, text=True)
+              return r.returncode
+          b = io.BytesIO()
+          with zipfile.ZipFile(b, "w", compression=zipfile.ZIP_DEFLATED) as z:
+              z.writestr("z.bin", "\x00" * (40 * 1024 * 1024))
+          assert run(b.getvalue(), "bomb.zip") == 4, "zip bomb not blocked"
+          b2 = io.BytesIO()
+          with zipfile.ZipFile(b2, "w") as z:
+              z.writestr("../up.txt", "x")
+          assert run(b2.getvalue(), "trav.zip") == 4, "traversal not blocked"
+          print("adversarial smoke: OK")
+          PY

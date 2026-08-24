@@ -1,21 +1,26 @@
-"""docsqueeze benchmark.
+"""docsqueeze benchmark - measures real token costs of ingestion strategies.
 
-Generates synthetic but representative documents entirely locally, then
-measures how many tokens each ingestion strategy would cost:
+Strategies compared per document:
+  b64      raw file base64-dumped into context (worst case some agents do)
+  Read     native agent PDF read: one page image each (~1,500 tokens/page)
+  dsq-full docsqueeze --full (every extracted character, no truncation)
+  dsq-24k  docsqueeze at the default 24,000-token budget
 
-  strategy A  raw file read as base64 into context
-  strategy B  native agent Read on PDF (page images) - approx 1500 tok/page
-  strategy C  docsqueeze --full   (all text, no truncation)
-  strategy D  docsqueeze default budget (24k tokens)
+Everything is generated or read locally; nothing is downloaded.
 
-Usage:  python tools/benchmark.py [--pages N] [--rows N]
+Usage:
+    python tools/benchmark.py                        # synthetic suite
+    python tools/benchmark.py --pdf-pages 50         # bigger PDF
+    python tools/benchmark.py --real "C:\\path\\book.pdf"
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -37,16 +42,21 @@ LOREM = (
     "every market segment during the review period. "
 )
 
+NATIVE_PAGE_TOKENS = 1500
+
 
 def make_pdf(pages: int, words_per_page: int = 220) -> bytes:
     objects: dict[int, bytes] = {}
     kids = " ".join(f"{3 + i} 0 R" for i in range(pages))
     objects[1] = b"<< /Type /Catalog /Pages 2 0 R >>"
     objects[2] = f"<< /Type /Pages /Kids [{kids}] /Count {pages} >>".encode()
-    objects[900] = b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    objects[900] = (
+        b"<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >>"
+    )
+    words = LOREM.split()
     for i in range(pages):
-        text = LOREM * (words_per_page // len(LOREM.split()) + 1)
-        text = " ".join(text.split()[:words_per_page])
+        text = " ".join(words[(i * 7) % len(words):] + words[: (i * 7) % len(words)])
+        text = " ".join((text + " " + LOREM).split()[:words_per_page])
         safe = text.replace("\\", r"\\").replace("(", r"\(").replace(")", r"\)")
         stream = f"BT /F1 11 Tf 60 740 Td ({safe}) Tj ET".encode("latin-1")
         comp = zlib.compress(stream)
@@ -56,8 +66,8 @@ def make_pdf(pages: int, words_per_page: int = 220) -> bytes:
             f"/Resources << /Font << /F1 900 0 R >> >> >>"
         ).encode()
         objects[cid] = (
-            b"<< /Length " + str(len(comp)).encode() + b" /Filter /FlateDecode >>\nstream\n"
-            + comp + b"\nendstream"
+            b"<< /Length " + str(len(comp)).encode()
+            + b" /Filter /FlateDecode >>\nstream\n" + comp + b"\nendstream"
         )
     out = bytearray(b"%PDF-1.4\n")
     offsets: dict[int, int] = {}
@@ -88,7 +98,8 @@ def make_docx(paragraphs: int) -> bytes:
         zf.writestr(
             "[Content_Types].xml",
             '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-            '<Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
+            '<Override PartName="/word/document.xml" ContentType="application/vnd.'
+            'openxmlformats-officedocument.wordprocessingml.document.main+xml"/></Types>',
         )
         zf.writestr("word/document.xml", doc)
     return buf.getvalue()
@@ -97,37 +108,42 @@ def make_docx(paragraphs: int) -> bytes:
 def make_xlsx(rows: int, cols: int = 8) -> bytes:
     shared = ["Alpha", "Beta", "Gamma", "Delta"]
     row_xml = []
-    epoch = date(1899, 12, 30)
     for r in range(rows):
         cells = []
         for c in range(cols):
             ref = f"{chr(65 + c)}{r + 1}"
-            v = shared[(r + c) % 4] if (r + c) % 7 == 0 else str((r * cols + c) % 9973)
-            t_attr = ' t="s"' if (r + c) % 7 == 0 else ""
-            idx = shared.index(v) if t_attr else ""
-            inner = idx if t_attr else v
-            cells.append(f'<c r="{ref}"{t_attr}><v>{inner}</v></c>')
+            if (r + c) % 7 == 0:
+                v = shared[(r + c) % 4]
+                cells.append(f'<c r="{ref}" t="s"><v>{shared.index(v)}</v></c>')
+            else:
+                cells.append(f'<c r="{ref}"><v>{(r * cols + c) % 9973}</v></c>')
         row_xml.append(f'<row r="{r + 1}">{"".join(cells)}</row>')
     sheet = (
-        '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
-        f"<sheetData>{''.join(row_xml)}</sheetData></worksheet>"
+        '<?xml version="1.0"?><worksheet xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main"><sheetData>' + "".join(row_xml) + "</sheetData></worksheet>"
     )
     wb = (
-        '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
-        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
-        '<sheets><sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
+        '<?xml version="1.0"?><workbook xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/'
+        'officeDocument/2006/relationships"><sheets>'
+        '<sheet name="Data" sheetId="1" r:id="rId1"/></sheets></workbook>'
     )
     ct = (
         '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
-        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
-        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
+        '<Override PartName="/xl/workbook.xml" ContentType="application/vnd.'
+        'openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/>'
+        '<Override PartName="/xl/worksheets/sheet1.xml" ContentType="application/vnd.'
+        'openxmlformats-officedocument.spreadsheetml.worksheet+xml"/></Types>'
     )
     rels = (
-        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">'
-        '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet1.xml"/></Relationships>'
+        '<?xml version="1.0"?><Relationships xmlns="http://schemas.openxmlformats.org/'
+        'package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.'
+        'openxmlformats.org/officeDocument/2006/relationships/worksheet" '
+        'Target="worksheets/sheet1.xml"/></Relationships>'
     )
     sst = (
-        '<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<?xml version="1.0"?><sst xmlns="http://schemas.openxmlformats.org/'
+        'spreadsheetml/2006/main">'
         + "".join(f"<si><t>{s}</t></si>" for s in shared)
         + "</sst>"
     )
@@ -141,30 +157,37 @@ def make_xlsx(rows: int, cols: int = 8) -> bytes:
     return buf.getvalue()
 
 
-def measure(name: str, data: bytes, fname: str, tmp: Path, *, pdf_pages: int | None) -> dict[str, object]:
-    p = tmp / fname
-    p.write_bytes(data)
+def measure(path: Path, label: str, *, pdf_pages: int | None) -> dict[str, object]:
+    data = path.read_bytes()
     started = time.perf_counter()
-    sections, meta = extract_document(p)
-    header = [f"[benchmark] file={fname}"]
+    sections, meta = extract_document(path)
+    header = [f"[docsqueeze] file={path.name}"]
     full_text, full_meta = build_output(header, sections, budget_tokens=10_000_000, full=True)
-    elapsed_full = time.perf_counter() - started
-
+    elapsed = time.perf_counter() - started
     budgeted_text, budgeted_meta = build_output(header, sections, budget_tokens=24000, full=False)
 
-    base64_tokens = estimate_tokens(f"data:{fname};base64," + __import__("base64").b64encode(data).decode())
-    native_vision_tokens = int((pdf_pages or 0) * 1500)
-
+    b64_tokens = estimate_tokens(
+        "data:application/octet-stream;base64," + base64.b64encode(data).decode()
+    )
+    native_tokens = int((pdf_pages or 0) * NATIVE_PAGE_TOKENS)
+    baseline = native_tokens if native_tokens else b64_tokens
     return {
-        "file": name,
+        "label": label,
         "raw_bytes": len(data),
-        "raw_base64_tokens": base64_tokens,
-        "native_read_tokens": native_vision_tokens,
+        "b64_tokens": b64_tokens,
+        "native_read_tokens": native_tokens,
         "dsq_full_tokens": full_meta["est_tokens_out"],
-        "dsq_budget_tokens": budgeted_meta["est_tokens_out"],
-        "dsq_full_chars": len(full_text),
-        "extract_seconds": round(elapsed_full, 3),
-        "strategy": budgeted_meta["strategy"],
+        "dsq_24k_tokens": budgeted_meta["est_tokens_out"],
+        "strategy_at_24k": budgeted_meta["strategy"],
+        "extract_seconds": round(elapsed, 2),
+        "engine": meta.get("engine_note", "-"),
+        "baseline_kind": "Read" if native_tokens else "b64",
+        "saved_pct_vs_baseline_full": round(
+            100.0 * (baseline - full_meta["est_tokens_out"]) / max(baseline, 1), 1
+        ),
+        "saved_pct_vs_baseline_24k": round(
+            100.0 * (baseline - budgeted_meta["est_tokens_out"]) / max(baseline, 1), 1
+        ),
     }
 
 
@@ -173,56 +196,96 @@ def main() -> int:
     ap.add_argument("--pdf-pages", type=int, default=30)
     ap.add_argument("--docx-paras", type=int, default=400)
     ap.add_argument("--xlsx-rows", type=int, default=5000)
+    ap.add_argument("--real", default=None, help="benchmark a real file on disk")
+    ap.add_argument("--builtin-pdf", action="store_true",
+                    help="add a builtin-engine row for the synthetic PDF")
     args = ap.parse_args()
 
+    rows: list[dict[str, object]] = []
     with tempfile.TemporaryDirectory(prefix="dsq-bench-") as td:
         tmp = Path(td)
-        results = [
-            measure(
-                f"PDF ({args.pdf_pages} pages)",
-                make_pdf(args.pdf_pages),
-                "bench.pdf",
-                tmp,
-                pdf_pages=args.pdf_pages,
-            ),
-            measure(
-                f"DOCX ({args.docx_paras} paragraphs)",
-                make_docx(args.docx_paras),
-                "bench.docx",
-                tmp,
-                pdf_pages=None,
-            ),
-            measure(
-                f"XLSX ({args.xlsx_rows:,} rows x 8)",
-                make_xlsx(args.xlsx_rows),
-                "bench.xlsx",
-                tmp,
-                pdf_pages=None,
-            ),
-        ]
+
+        pdf_path = tmp / "bench.pdf"
+        pdf_path.write_bytes(make_pdf(args.pdf_pages))
+        rows.append(measure(pdf_path, f"synthetic PDF ({args.pdf_pages} pages)", pdf_pages=args.pdf_pages))
+
+        if args.builtin_pdf:
+            os.environ["DOCSQUEEZE_ENGINE"] = "builtin"
+            try:
+                rows.append(measure(pdf_path, f"same PDF, stdlib engine only", pdf_pages=args.pdf_pages))
+            finally:
+                os.environ.pop("DOCSQUEEZE_ENGINE", None)
+
+        docx_path = tmp / "bench.docx"
+        docx_path.write_bytes(make_docx(args.docx_paras))
+        rows.append(measure(docx_path, f"synthetic DOCX ({args.docx_paras} paras)", pdf_pages=None))
+
+        xlsx_path = tmp / "bench.xlsx"
+        xlsx_path.write_bytes(make_xlsx(args.xlsx_rows))
+        rows.append(measure(xlsx_path, f"synthetic XLSX ({args.xlsx_rows:,} rows x 8)", pdf_pages=None))
+
+        real_label = None
+        if args.real:
+            rp = Path(args.real)
+            if rp.exists():
+                ext = rp.suffix.lower()
+                pages = None
+                if ext == ".pdf":
+                    try:
+                        import pypdf  # type: ignore
+
+                        pages = len(pypdf.PdfReader(str(rp)).pages)
+                    except Exception:
+                        pages = None
+                real_label = f"real file: {rp.name}" + (f" ({pages} pages)" if pages else "")
+                rows.append(measure(rp, real_label, pdf_pages=pages))
 
     print()
-    print(f"{'document':<28}{'raw size':>10}{'b64 tokens':>13}{'native Read':>13}{'dsq FULL':>12}{'dsq BUDGET':>12}{'saved':>8}{'vs':>10}")
-    print("-" * 103)
-    for r in results:
-        if r["native_read_tokens"] > 0:
-            baseline = r["native_read_tokens"]
-            label = "Read"
-        else:
-            baseline = r["raw_base64_tokens"]
-            label = "b64"
-        saved = 100 * (baseline - r["dsq_full_tokens"]) / baseline if baseline else 0.0
+    print(
+        f"{'document':<38}{'size':>9}{'b64 tok':>10}{'Read tok':>10}"
+        f"{'FULL':>9}{'24k':>8}{'saved*':>8}{'sec':>7}{'engine':>9}"
+    )
+    print("-" * 108)
+    for r in rows:
         print(
-            f"{r['file']:<28}{human_size(r['raw_bytes']):>10}"
-            f"{r['raw_base64_tokens']:>13,}{r['native_read_tokens']:>13,}"
-            f"{r['dsq_full_tokens']:>12,}{r['dsq_budget_tokens']:>12,}{saved:>7.1f}%{label:>10}"
+            f"{str(r['label'])[:37]:<38}{human_size(r['raw_bytes']):>9}"
+            f"{r['b64_tokens']:>10,}{r['native_read_tokens']:>10,}"
+            f"{r['dsq_full_tokens']:>9,}{r['dsq_24k_tokens']:>8,}"
+            f"{r['saved_pct_vs_baseline_full']:>7.1f}%{r['extract_seconds']:>7.2f}"
+            f"{str(r['engine']):>9}"
         )
-    print("-" * 103)
-    print("notes: 'native Read' models per-PDF-page image cost (~1,500 tokens/page);")
-    print("       dsq BUDGET is capped by the 24,000-token default budget with")
-    print("       head+tail elision and exact fetch hints for elided ranges.")
+    print("-" * 108)
+    print("* saved vs the relevant worst-case baseline (page-image Read for PDFs,")
+    print("  raw-base64 for everything else), using FULL untruncated extraction.")
     print()
-    print(json.dumps(results, indent=1))
+    print(json.dumps(rows, indent=1))
+
+    md_path = REPO_ROOT / "docs" / "BENCHMARKS.md"
+    if md_path.parent.exists():
+        lines = [
+            "# Measured benchmarks",
+            "",
+            f"Machine: local run on {sys.platform}, Python {sys.version.split()[0]},",
+            f"docsqueeze {__import__('docsqueeze.core', fromlist=['VERSION']).VERSION}.",
+            "Token counts use docsqueeze's calibrated BPE heuristic (chars/4 ASCII, ~1/char CJK).",
+            "'Read' models native per-page image ingestion at ~1,500 tokens/page.",
+            "",
+            "| document | size | b64 tokens | Read tokens | dsq FULL | dsq @24k | saved vs baseline (full) | seconds | engine |",
+            "|---|---|---|---|---|---|---|---|---|",
+        ]
+        for r in rows:
+            lines.append(
+                f"| {r['label']} | {human_size(r['raw_bytes'])} | {r['b64_tokens']:,} | "
+                f"{r['native_read_tokens']:,} | {r['dsq_full_tokens']:,} | {r['dsq_24k_tokens']:,} | "
+                f"{r['saved_pct_vs_baseline_full']}% | {r['extract_seconds']}s | {r['engine']} |"
+            )
+        lines += [
+            "",
+            "Reproduce with `python tools/benchmark.py --real <file>`.",
+            "",
+        ]
+        md_path.write_text("\n".join(lines), encoding="utf-8")
+        print(f"wrote {md_path}")
     return 0
 
 

@@ -644,7 +644,17 @@ class TestXmlAttacks(Base):
         )
         code, out, err = self.extract(xml.encode(), "xxe.xml")
         self.assertIn(code, (eng.EXIT_OK, eng.EXIT_PARSE))
-        self.assertNotIn("/etc/passwd\nroot:", out or "")
+        if code == eng.EXIT_OK:
+            self.assertIn("&xxe;", out)
+            self.assertNotIn("root:x:0:0", out)
+
+    def test_numeric_entities_preserved_after_hardening(self) -> None:
+        xml = '<?xml version="1.0"?><root>caf&#233; cr&#xE8;me &amp; sugar</root>'
+        code, out, err = self.extract(xml.encode(), "ents.xml")
+        self.assertOk(code, err)
+        self.assertIn("caf\u00e9", out)
+        self.assertIn("\u00e8", out)
+        self.assertIn("&amp; sugar" if "&amp;" in out else "& sugar", out)
 
 
 class TestDelimitedAndInjection(Base):
@@ -919,6 +929,136 @@ class TestCliEndToEnd(unittest.TestCase):
             capture_output=True, text=True,
         )
         self.assertEqual(proc.returncode, eng.EXIT_SECURITY)
+
+
+class TestHardeningV11(Base):
+    """v1.1.0 hardening: ReDoS probes, memory bounds, positioning, fidelity."""
+
+    def test_banner_sits_between_head_and_tail(self) -> None:
+        sections = [
+            eng.Section(f"=== [page {i}/6] ===", f"content-{i} " + "filler " * 500, f"--pages {i}")
+            for i in range(1, 7)
+        ]
+        text, meta = eng.build_output(["[h]"], sections, budget_tokens=1200, full=False)
+        self.assertEqual(meta["strategy"], "head+tail")
+        pos_head = text.find("content-1")
+        pos_banner = text.find("[[docsqueeze elided")
+        pos_tail = text.find("=== [page 6/6] ===", pos_banner if pos_banner > 0 else 0)
+        self.assertGreater(pos_banner, 0, "banner missing")
+        self.assertGreater(pos_tail, pos_banner, "tail must come AFTER banner")
+        self.assertGreater(pos_banner, pos_head, "banner must come AFTER head")
+
+    def test_cmap_quadratic_probe_completes_fast(self) -> None:
+        import time as _t
+
+        crafted = (b"beginbfchar <0041> <0042> endbfchar\n" * 200) + b"beginbfchar " + b"x" * (1_000_000)
+        started = _t.perf_counter()
+        mapping = eng.parse_tounicode_cmap(crafted)
+        elapsed = _t.perf_counter() - started
+        self.assertEqual(mapping.get(0x41), "B")
+        self.assertLess(elapsed, 5.0, f"CMap parse too slow: {elapsed:.2f}s (quadratic?)")
+
+    def test_doctype_scanner_linear_on_adversarial_xml(self) -> None:
+        import time as _t
+
+        payload = b'<?xml version="1.0"?><!DOCTYPE a' * 4000 + b"<root>ok</root>"
+        p = write_fixture(self.tmp, "adv.xml", payload)
+        started = _t.perf_counter()
+        code, out, err = run_engine(p)
+        elapsed = _t.perf_counter() - started
+        self.assertIn(code, (eng.EXIT_OK, eng.EXIT_PARSE))
+        self.assertLess(elapsed, 10.0, f"DTD handling too slow: {elapsed:.2f}s")
+
+    def test_giant_content_types_entry_bounded(self) -> None:
+        import time as _t
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr("[Content_Types].xml", "<Types/>" + "\x00" * (40 * 1024 * 1024))
+            zf.writestr(
+                "word/document.xml",
+                '<w:document xmlns:w="http://schemas.openxmlformats.org/wordprocessingml/2006/main"><w:body><w:p><w:r><w:t>hi</w:t></w:r></w:p></w:body></w:document>',
+            )
+        p = write_fixture(self.tmp, "giant.docx", buf.getvalue())
+        started = _t.perf_counter()
+        code, out, err = run_engine(p)
+        elapsed = _t.perf_counter() - started
+        self.assertIn(code, (eng.EXIT_OK, eng.EXIT_SECURITY, eng.EXIT_PARSE))
+        self.assertLess(elapsed, 15.0, f"giant entry handling too slow: {elapsed:.1f}s")
+        if code == eng.EXIT_OK:
+            self.assertIn("hi", out)
+
+    def test_csv_minus_formula_variants(self) -> None:
+        csv_data = "a,b\n-42,=HYPERLINK(http://x)\n7,-5\n"
+        code, out, err = self.extract(csv_data.encode(), "minus.csv")
+        self.assertOk(code, err)
+        self.assertIn("'=HYPERLINK(http://x)[FORMULA?]", out)
+        self.assertIn("-42\t", out)
+        self.assertIn("\t-5", out)
+        self.assertNotIn("-42[FORMULA?]", out)
+        self.assertNotIn("-5[FORMULA?]", out)
+
+    def test_backslash_traversal_entry_blocked(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr("..\\evil.txt", "boom")
+        code, out, err = self.extract(buf.getvalue(), "bs.zip")
+        self.assertEqual(code, eng.EXIT_SECURITY)
+
+    def test_empty_archive_lists_cleanly(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            pass
+        code, out, err = self.extract(buf.getvalue(), "empty.zip")
+        self.assertOk(code, err)
+        self.assertIn("archive contents", out)
+
+    def test_deep_mime_eml_no_crash(self) -> None:
+        import email.message
+        import email.encoders
+        from email.mime.multipart import MIMEMultipart
+        from email.mime.text import MIMEText
+
+        msg = MIMEText("leaf", "plain")
+        for _ in range(60):
+            outer = MIMEMultipart()
+            outer.attach(msg)
+            msg = outer
+        raw = msg.as_bytes()
+        code, out, err = self.extract(raw, "deep.eml")
+        self.assertIn(code, (eng.EXIT_OK, eng.EXIT_PARSE))
+
+    def test_jsonl_single_giant_line_bounded(self) -> None:
+        big = {"blob": "y" * (3 * 1024 * 1024)}
+        code, out, err = self.extract(json.dumps(big).encode(), "giant.jsonl")
+        self.assertOk(code, err)
+        body_chars = len(out.split("\n", 1)[1]) if "\n" in out else len(out)
+        self.assertLess(body_chars, 600_000)
+
+    def test_cjk_single_section_windowing_respects_budget(self) -> None:
+        sections = [eng.Section("=== [text] ===", "\u4f60\u597d\u4e16\u754c" * 30000)]
+        text, meta = eng.build_output(["h"], sections, budget_tokens=1000, full=False)
+        self.assertEqual(meta["strategy"], "single-window")
+        self.assertIn("characters elided", text)
+        self.assertLessEqual(meta["est_tokens_out"], 1000 + 800)
+
+    def test_form_feed_and_control_chars_sanitized(self) -> None:
+        raw = b"a\x0cb\x07c\x1b[31md"
+        code, out, err = self.extract(raw, "ctl.txt")
+        self.assertOk(code, err)
+        self.assertNotIn("\x07", out)
+        self.assertNotIn("\x1b", out)
+
+    def test_symlinked_input_file_resolves(self) -> None:
+        target = write_fixture(self.tmp, "real.txt", b"symlink ok")
+        link = self.tmp / "link.txt"
+        try:
+            link.symlink_to(target)
+        except (OSError, NotImplementedError):
+            self.skipTest("symlinks unsupported here")
+        code, out, err = run_engine(link)
+        self.assertOk(code, err)
+        self.assertIn("symlink ok", out)
 
 
 if __name__ == "__main__":
