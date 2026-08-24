@@ -3,6 +3,32 @@
 All notable changes to docsqueeze are documented here.
 Format follows Keep a Changelog; versioning follows SemVer.
 
+## [1.2.1] - 2026-08-24
+
+### Fixed
+- **RTF `\'hh` hex escapes now decode.** Accented and non-ASCII text encoded
+  the standard RTF way (`caf\'e9`) previously leaked the two hex digits as
+  literal text (`cafe9`). Regression test added.
+- **PPTX anchors use slide position, not file number.** Decks with gaps in
+  slide XML numbering produced impossible anchors like `[slide 3/2]`; anchors
+  now number positionally (`[slide 2/2]`). Regression test added.
+- **XML nesting cap lowered to 800** (was 2,000), safely below CPython's
+  default recursion limit, so crafted deep files hit the guard instead of
+  `RecursionError`. The cap message now reflects the active limit.
+- **`--max-tokens` now reaches the JSON summarizer.** Small budgets on large
+  JSON get the structural summary immediately instead of a windowed flat
+  dump that the budget engine then had to trim again.
+- Removed dead `_AGL_MINI`/`glyph_name_to_unicode` table (~1.8 KB) and a
+  confusing no-op slice artifact in the CSV row-caps path.
+- Fixed double-encoded punctuation (mojibake) in the skill instructions.
+
+### Changed
+- **PDF page-filter pushdown:** `--pages` now skips content-stream decode and
+  font collection for unselected pages in the builtin engine (and skips
+  `extract_text()` in pypdf/PyMuPDF accelerators). Targeted page fetches on
+  large PDFs no longer pay full-document extraction cost.
+- Version bumped to 1.2.1 across core, pyproject, and skill metadata.
+
 ## [1.2.0] - 2026-08-24
 
 ### Security

@@ -5,7 +5,7 @@ description: >
   search, summarize, quote, or extract data from any PDF (.pdf), Word (.docx),
   Excel (.xlsx), PowerPoint (.pptx), OpenDocument (.odt/.ods/.odp), EPUB,
   RTF, HTML, XML, CSV, TSV, JSON, JSONL, TOML, INI, email (.eml), Jupyter
-  notebook (.ipynb), SQLite database, log, or large text file â€” instead of
+  notebook (.ipynb), SQLite database, log, or large text file — instead of
   reading the raw file, which burns massive context/vision tokens. Also use
   when the user says "read this PDF", "summarize this document", "what does
   this spreadsheet say", uploads or attaches any file, or when a task
@@ -16,14 +16,14 @@ description: >
 license: MIT
 metadata:
   engine: scripts/docsqueeze.py
-  version: "1.2.0"
+  version: "1.2.1"
 ---
 
-# docsqueeze â€” token-efficient universal document reader
+# docsqueeze — token-efficient universal document reader
 
 Reading raw binary documents wastes enormous context. A 20-page PDF costs
-40,000â€“70,000 tokens when rendered natively (every page becomes an image);
-docsqueeze delivers the same content as anchored text for ~2,000â€“12,000
+40,000–70,000 tokens when rendered natively (every page becomes an image);
+docsqueeze delivers the same content as anchored text for ~2,000–12,000
 tokens, with stable citations.
 
 ## When this skill applies

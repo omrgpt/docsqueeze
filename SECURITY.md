@@ -33,7 +33,9 @@ email attachments, downloads, repository fixtures. Attacker goals:
   loops iterate only up to the cap (excess pages reported via
   `pages_truncated_to_cap`).
 - PDF object-count cap (500k), per-stream inflate cap (256 MB), nesting
-  depth caps everywhere (page tree 64, XML heuristic 2,000, walkers ≤128).
+  depth caps everywhere (page tree 64, XML heuristic 800 — below CPython's
+  default recursion limit so the guard trips before the interpreter does,
+  walkers ≤128).
 - JSON/TOML/INI parse caps; JSONL head/tail windows; CSV row caps.
 - Repeated-line collapse and base64-blob elision stop log-flooding tricks.
 

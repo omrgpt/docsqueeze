@@ -86,7 +86,7 @@ Exit codes: `0` ok · `2` usage · `3` unsupported · `4` security block ·
 ### Output contract
 
 ```
-[docsqueeze v1.1.0] file=report.pdf size=2.1MB format=pdf pages=24 engine=pypdf time=0.41s
+[docsqueeze v1.2.1] file=report.pdf size=2.1MB format=pdf pages=24 engine=pypdf time=0.41s
 === [page 1/24] ===
 ...
 [[docsqueeze elided 14 section(s) (=== [page 6/24] === .. === [page 19/24] ===, ~9,412 tokens).
@@ -143,7 +143,7 @@ design).
 ## Development
 
 ```bash
-python -m unittest discover -s tests -v   # 72 tests incl. adversarial suite
+python -m unittest discover -s tests -v   # 77 tests incl. adversarial suite
 python tools/benchmark.py                 # regenerate measured numbers
 python tools/sync_skill.py --check        # verify installed copies match repo
 ```

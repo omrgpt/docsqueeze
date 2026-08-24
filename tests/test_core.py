@@ -1128,3 +1128,63 @@ class TestHardeningV11(Base):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestHardeningV12(Base):
+    """v1.2.1 regressions: RTF hex escapes, PPTX gap anchors, depth cap."""
+
+    def test_rtf_hex_escape_decodes(self) -> None:
+        rtf = rb"{\rtf1\ansi caf\'e9 cr\'e8me \u9731? end}"
+        code, out, err = self.extract(rtf, "hex.rtf")
+        self.assertOk(code, err)
+        self.assertIn("caf\u00e9 cr\u00e8me", out)
+        self.assertNotIn("e9 cr", out)  # hex digits must not leak
+
+    def test_pptx_gap_numbering_uses_position(self) -> None:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w") as zf:
+            zf.writestr(
+                "[Content_Types].xml",
+                '<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types">'
+                '<Default Extension="xml" ContentType="application/xml"/>'
+                '<Override PartName="/ppt/presentation.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.presentation.main+xml"/>'
+                '<Override PartName="/ppt/slides/slide1.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+                '<Override PartName="/ppt/slides/slide3.xml" ContentType="application/vnd.openxmlformats-officedocument.presentationml.slide+xml"/>'
+                "</Types>",
+            )
+            zf.writestr(
+                "ppt/presentation.xml",
+                '<?xml version="1.0"?><p:presentation xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main"><p:sldIdLst/></p:presentation>',
+            )
+            sld = (
+                '<?xml version="1.0"?><p:sld xmlns:p="http://schemas.openxmlformats.org/presentationml/2006/main" '
+                'xmlns:a="http://schemas.openxmlformats.org/drawingml/2006/main"><p:cSld><p:spTree>'
+                "<a:p><a:r><a:t>%s</a:t></a:r></a:p></p:spTree></p:cSld></p:sld>"
+            )
+            zf.writestr("ppt/slides/slide1.xml", sld % "ONE")
+            zf.writestr("ppt/slides/slide3.xml", sld % "THREE")
+        code, out, err = self.extract(buf.getvalue(), "gap.pptx")
+        self.assertOk(code, err)
+        self.assertIn("=== [slide 1/2] ===", out)
+        self.assertIn("=== [slide 2/2] ===", out)  # position, not file number
+        self.assertNotIn("[slide 3/2]", out)
+
+    def test_xml_depth_cap_below_recursion_limit(self) -> None:
+        deep = ("<a>" * 1200) + ("</a>" * 1200)
+        code, out, err = self.extract(deep.encode(), "deep1200.xml")
+        self.assertEqual(code, eng.EXIT_SECURITY)
+        self.assertIn("nest", err.lower())
+
+    def test_json_small_budget_gets_summary(self) -> None:
+        big = {"items": [{"id": i, "blob": "y" * 60} for i in range(2000)]}
+        code, out, err = self.extract(json.dumps(big).encode(), "sb.json", "--max-tokens", "1200")
+        self.assertOk(code, err)
+        self.assertIn("list of 2,000 items", out)
+
+    def test_pages_pushdown_returns_requested_only(self) -> None:
+        pdf = build_pdf([f"pushdown page {i}" for i in range(1, 21)])
+        code, out, err = self.extract(pdf, "pd.pdf", "--pages", "3")
+        self.assertOk(code, err)
+        self.assertIn("pushdown page 3", out)
+        self.assertNotIn("[page 2/", out)
+        self.assertNotIn("[page 4/", out)

@@ -44,7 +44,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator
 from urllib.parse import quote as url_quote
 
-VERSION = "1.2.0"
+VERSION = "1.2.1"
 PROG = "docsqueeze"
 
 EXIT_OK = 0
@@ -110,7 +110,7 @@ MAX_CSV_TAIL_ROWS = _env_int("DOCSQUEEZE_CSV_TAIL_ROWS", 200, 100000)
 BASE64_RUN_ELIDE = 256
 REPEAT_LINE_COLLAPSE = 60
 MAX_SECTION_CHARS = 2_000_000
-MAX_XML_DEPTH_HEURISTIC = 2000
+MAX_XML_DEPTH_HEURISTIC = 800
 MAX_JSON_DEPTH = 64
 
 
@@ -756,7 +756,9 @@ def parse_xml_safe(data: bytes):
             f"XML part exceeds {human_size(MAX_XML_PART_BYTES)} cap"
         )
     if _xml_depth_heuristic(data) > MAX_XML_DEPTH_HEURISTIC:
-        raise SecurityError("XML nesting deeper than 2000 levels (recursion bomb)")
+        raise SecurityError(
+            f"XML nesting deeper than {MAX_XML_DEPTH_HEURISTIC} levels (recursion bomb)"
+        )
     try:
         return ET.fromstring(data)
     except ET.ParseError as exc:
@@ -935,49 +937,6 @@ class PdfLexer:
             out.append(c)
             self.pos += 1
         return b"(" + bytes(out) + b")"
-
-
-_AGL_MINI = {
-    "space": " ", "exclam": "!", "quotedbl": '"', "numbersign": "#",
-    "dollar": "$", "percent": "%", "ampersand": "&", "quotesingle": "'",
-    "parenleft": "(", "parenright": ")", "asterisk": "*", "plus": "+",
-    "comma": ",", "hyphen": "-", "period": ".", "slash": "/", "colon": ":",
-    "semicolon": ";", "less": "<", "equal": "=", "greater": ">",
-    "question": "?", "at": "@", "bracketleft": "[", "backslash": "\\",
-    "bracketright": "]", "asciicircum": "^", "underscore": "_",
-    "grave": "`", "braceleft": "{", "bar": "|", "braceright": "}",
-    "asciitilde": "~", "bullet": "\u2022", "dagger": "\u2020",
-    "daggerdbl": "\u2021", "ellipsis": "\u2026", "emdash": "\u2014",
-    "endash": "\u2013", "quotesinglbase": "\u201a", "quotedblbase": "\u201e",
-    "quoteleft": "\u2018", "quoteright": "\u2019", "quotedblleft": "\u201c",
-    "quotedblright": "\u201d", "florin": "\u0192", "circumflex": "^",
-    "perthousand": "\u2030", "Scaron": "\u0160", "guilsinglleft": "\u2039",
-    "OE": "\u0152", "trademark": "\u2122", "Zcaron": "\u017d",
-    "guilsinglright": "\u203a", "oe": "\u0153", "scaron": "\u0161",
-    "zcaron": "\u017e", "fi": "fi", "fl": "fl", "Euro": "\u20ac",
-    "mu": "\u00b5", "afii61352": "\u2116", "minus": "-", "fraction": "/",
-}
-
-
-def glyph_name_to_unicode(name: str) -> str:
-    if not name:
-        return ""
-    if name.startswith("uni") and len(name) == 7:
-        try:
-            return chr(int(name[3:], 16))
-        except ValueError:
-            return ""
-    if name.startswith("u") and len(name) >= 5 and name[1:].isdigit():
-        try:
-            return chr(int(name[1:]))
-        except ValueError:
-            return ""
-    base = name.split(".")[0]
-    if base in _AGL_MINI:
-        return _AGL_MINI[base]
-    if len(base) == 1:
-        return base
-    return ""
 
 
 def parse_tounicode_cmap(data: bytes) -> dict[int, str]:
@@ -1443,7 +1402,7 @@ def _pdf_is_encrypted(data: bytes) -> bool:
     return False
 
 
-def _try_accelerator_pdf(data: bytes):
+def _try_accelerator_pdf(data: bytes, page_filter=None):
     # Accelerators are optional and opt-in (DOCSQUEEZE_ENGINE=auto). Their
     # page loops are bounded by MAX_PDF_PAGES so a 100k-page PDF cannot burn
     # CPU past the same cap the builtin engine enforces.
@@ -1460,6 +1419,9 @@ def _try_accelerator_pdf(data: bytes):
         limit = min(total, MAX_PDF_PAGES)
         pages: list[tuple[int, str]] = []
         for i in range(limit):
+            if page_filter is not None and not page_filter(i + 1):
+                pages.append((i + 1, ""))
+                continue
             page = reader.pages[i]
             try:
                 pages.append((i + 1, page.extract_text() or ""))
@@ -1485,6 +1447,9 @@ def _try_accelerator_pdf(data: bytes):
         limit = min(total, MAX_PDF_PAGES)
         pages = []
         for i in range(limit):
+            if page_filter is not None and not page_filter(i + 1):
+                pages.append((i + 1, ""))
+                continue
             pages.append((i + 1, doc.load_page(i).get_text() or ""))
         doc.close()
         meta = {"pages": len(pages), "engine_note": "pymupdf"}
@@ -1498,7 +1463,9 @@ def _try_accelerator_pdf(data: bytes):
         return None
 
 
-def extract_pdf_builtin(data: bytes) -> tuple[list[tuple[int, str]], dict[str, Any]]:
+def extract_pdf_builtin(
+    data: bytes, page_filter: Callable[[int], bool] | None = None
+) -> tuple[list[tuple[int, str]], dict[str, Any]]:
     doc = PdfDocument(data)
     root = doc.resolve(doc.trailer.get("Root"))
     if not isinstance(root, dict):
@@ -1550,6 +1517,9 @@ def extract_pdf_builtin(data: bytes) -> tuple[list[tuple[int, str]], dict[str, A
 
     results: list[tuple[int, str]] = []
     for idx, page_dict in enumerate(page_dicts, start=1):
+        if page_filter is not None and not page_filter(idx):
+            results.append((idx, ""))
+            continue
         res = page_dict.get("Resources")
         res_val = res if isinstance(res, dict) else doc.resolve(res)
         fonts = pdf_collect_fonts(doc, res_val)
@@ -1596,7 +1566,7 @@ def extract_pdf(path: Path, data: bytes, page_filter: Callable[[int], bool] | No
     engine_mode = os.environ.get("DOCSQUEEZE_ENGINE", "builtin").strip().lower()
     accelerated = None
     if engine_mode in ("auto", "accel", "accelerators"):
-        accelerated = _try_accelerator_pdf(data)
+        accelerated = _try_accelerator_pdf(data, page_filter)
     if accelerated is not None:
         pages, meta = accelerated
     elif _pdf_is_encrypted(data):
@@ -1606,7 +1576,7 @@ def extract_pdf(path: Path, data: bytes, page_filter: Callable[[int], bool] | No
             "files can open via pypdf."
         )
     else:
-        pages, meta = extract_pdf_builtin(data)
+        pages, meta = extract_pdf_builtin(data, page_filter)
     sections: list[Section] = []
     empty_pages = 0
     for pageno, text in pages:
@@ -2031,7 +2001,7 @@ def extract_pptx(zf, members, budget_box: dict[str, int]) -> tuple[list[Section]
         if nm:
             notes_map[int(nm.group(1))] = info
     sections: list[Section] = []
-    for sn in slide_nums:
+    for slide_pos, sn in enumerate(slide_nums, start=1):
         info = name_to_info.get(f"ppt/slides/slide{sn}.xml")
         if info is None:
             continue
@@ -2066,7 +2036,7 @@ def extract_pptx(zf, members, budget_box: dict[str, int]) -> tuple[list[Section]
             except DocsqueezeError:
                 pass
         body = "\n".join(lines) or "[slide with no text]"
-        sections.append(Section(f"=== [slide {sn}/{len(slide_nums)}] ===", body, "--full"))
+        sections.append(Section(f"=== [slide {slide_pos}/{len(slide_nums)}] ===", body, "--full"))
     if not sections:
         raise DocsqueezeError("pptx contains no readable slides")
     return sections, {"slides": len(slide_nums)}
@@ -2444,7 +2414,18 @@ def rtf_to_text(src: str) -> str:
                         out.append("\u00a0")
                     elif esc in ("{", "}", "\\"):
                         out.append(esc)
-                i += 2
+                    elif esc == "'":
+                        # \'hh hex escape: the standard RTF encoding for
+                        # non-ASCII bytes (accents, CJK byte pairs). Without
+                        # this the two hex digits leak in as literal text.
+                        hx = src[i + 2 : i + 4]
+                        try:
+                            out.append(
+                                bytes([int(hx, 16)]).decode("cp1252", errors="replace")
+                            )
+                        except (ValueError, UnicodeDecodeError):
+                            pass
+                i += 4 if esc == "'" else 2
                 continue
             i += 1
             continue
@@ -2519,10 +2500,10 @@ def extract_delimited(path: Path, data: bytes, declared_ext: str) -> tuple[list[
             processed.append(new_cell.replace("\t", " ").replace("\n", " "))
         out_rows.append("\t".join(processed))
     if len(out_rows) > MAX_CSV_HEAD_ROWS + MAX_CSV_TAIL_ROWS:
+        elided = total_rows_estimate - MAX_CSV_HEAD_ROWS - MAX_CSV_TAIL_ROWS
         shown = (
             out_rows[:MAX_CSV_HEAD_ROWS]
-            + [[f"~{total_rows_estimate - MAX_CSV_HEAD_ROWS - MAX_CSV_TAIL_ROWS:,} more rows elided"]][0:0]
-            + [f"[[~{total_rows_estimate - MAX_CSV_HEAD_ROWS - MAX_CSV_TAIL_ROWS:,} more rows elided]]"]
+            + [f"[[~{elided:,} more rows elided]]"]
             + out_rows[-MAX_CSV_TAIL_ROWS:]
         )
     else:
@@ -2549,7 +2530,9 @@ def extract_delimited(path: Path, data: bytes, declared_ext: str) -> tuple[list[
 # ---------------------------------------------------------------------------
 
 
-def extract_json(data: bytes) -> tuple[list[Section], dict[str, Any]]:
+def extract_json(
+    data: bytes, budget_tokens: int | None = None
+) -> tuple[list[Section], dict[str, Any]]:
     text = decode_bytes(data)
     if len(text) > MAX_XML_PART_BYTES:
         raise SecurityError("JSON larger than safety cap")
@@ -2596,7 +2579,8 @@ def extract_json(data: bytes) -> tuple[list[Section], dict[str, Any]]:
         return s[:600]
 
     compact = json.dumps(parsed, ensure_ascii=False, default=str)
-    if estimate_tokens(compact) <= DEFAULT_BUDGET_TOKENS:
+    effective = budget_tokens if budget_tokens is not None else DEFAULT_BUDGET_TOKENS
+    if estimate_tokens(compact) <= effective:
         body = compact
     else:
         body = summarize(parsed)
@@ -2957,6 +2941,7 @@ def extract_document(
     pages_spec: str | None = None,
     sheets_spec: str | None = None,
     force_format: str | None = None,
+    budget_tokens: int | None = None,
 ) -> tuple[list[Section], dict[str, Any]]:
     data = load_input(path)
     declared_ext = path.suffix.lower()
@@ -3066,7 +3051,7 @@ def extract_document(
         body = sanitize_text("\n".join(lines))
         return [Section("=== [xml tree] ===", body or "[empty xml]", "--full")], {}
     if fmt == "json":
-        return extract_json(data)
+        return extract_json(data, budget_tokens)
     if fmt == "jsonl":
         return extract_jsonl(data)
     if fmt == "delimited":
@@ -3139,6 +3124,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--stats-only", action="store_true", help="metadata only, no body")
     args = parser.parse_args(argv)
 
+    budget = args.max_tokens if args.max_tokens is not None else DEFAULT_BUDGET_TOKENS
+    budget = max(200, min(budget, 2_000_000))
+
     started = time.perf_counter()
     try:
         resolved = validate_input_path(args.path)
@@ -3148,6 +3136,7 @@ def main(argv: list[str] | None = None) -> int:
             pages_spec=args.pages,
             sheets_spec=args.sheets,
             force_format=args.force_format,
+            budget_tokens=budget,
         )
     except DocsqueezeError as exc:
         payload = {"ok": False, "tool": PROG, "error": str(exc), "exit_code": exc.exit_code}
@@ -3174,9 +3163,6 @@ def main(argv: list[str] | None = None) -> int:
         print(f"[{PROG}] ERROR: internal failure: {type(exc).__name__}: {exc}", file=sys.stderr)
         return EXIT_PARSE
     elapsed = time.perf_counter() - started
-
-    budget = args.max_tokens if args.max_tokens is not None else DEFAULT_BUDGET_TOKENS
-    budget = max(200, min(budget, 2_000_000))
 
     fmt_label = args.force_format or resolved.suffix.lstrip(".") or "auto"
     header = _build_header(resolved, fmt_label, meta, elapsed, data_size)
