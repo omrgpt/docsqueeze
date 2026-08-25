@@ -2728,6 +2728,13 @@ def extract_eml(data: bytes) -> tuple[list[Section], dict[str, Any]]:
 # ---------------------------------------------------------------------------
 
 
+# SEC-019 allowlist for dynamic SQL identifiers (table/view names read back
+# from sqlite_master). Names failing this pattern are NEVER interpolated into
+# SQL — they're reported as skipped instead. Defense-in-depth layered on top of
+# the read-only immutable URI, PRAGMA query_only, and quote-escaping below.
+_SQLITE_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_ ]*$")
+
+
 def extract_sqlite(path: Path) -> tuple[list[Section], dict[str, Any]]:
     import sqlite3
 
@@ -2748,15 +2755,23 @@ def extract_sqlite(path: Path) -> tuple[list[Section], dict[str, Any]]:
         objects = cur.fetchall()
         meta["objects"] = len(objects)
         for name, otype in objects:
-            safe_name = '"' + name.replace('"', '""') + '"'
+            if not _SQLITE_IDENT_RE.fullmatch(name):
+                # SEC-019: identifier fails the strict allowlist — list the
+                # object but NEVER build SQL from it. Quote-escaping alone
+                # is not sufficient for dynamic identifiers.
+                lines.append(f"## {otype}: {name}")
+                lines.append("[skipped: identifier outside safe pattern]")
+                lines.append("")
+                continue
+            qname = '"' + name.replace('"', '""') + '"'
             cnt: Any = "?"
             try:
-                cnt = conn.execute(f"SELECT COUNT(*) FROM {safe_name}").fetchone()[0]
+                cnt = conn.execute(f"SELECT COUNT(*) FROM {qname}").fetchone()[0]  # noqa: SEC-019 — ident gated by _SQLITE_IDENT_RE.fullmatch above
             except sqlite3.Error:
                 pass
             lines.append(f"## {otype}: {name} ({cnt} rows)" if cnt != "?" else f"## {otype}: {name}")
             try:
-                cols = conn.execute(f"PRAGMA table_info({safe_name})").fetchall()
+                cols = conn.execute(f"PRAGMA table_info({qname})").fetchall()
                 col_desc = ", ".join(
                     f"{c[1]}:{c[2]}" + (" PK" if c[5] else "") for c in cols
                 )
@@ -2766,7 +2781,7 @@ def extract_sqlite(path: Path) -> tuple[list[Section], dict[str, Any]]:
                 pass
             if isinstance(cnt, int) and cnt > 0:
                 try:
-                    scur = conn.execute(f"SELECT * FROM {safe_name} LIMIT 5")
+                    scur = conn.execute(f"SELECT * FROM {qname} LIMIT 5")  # noqa: SEC-019 — ident gated by _SQLITE_IDENT_RE.fullmatch above
                     colnames = [d[0] for d in scur.description]
                     lines.append("sample:")
                     lines.append("\t".join(colnames))

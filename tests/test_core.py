@@ -808,6 +808,30 @@ class TestSqliteIpynbEmlImage(Base):
         self.assertIn("id:INTEGER PK", out)
         self.assertIn("ann", out)
 
+    def test_sqlite_hostile_identifiers_never_reach_sql(self) -> None:
+        """SEC-019: identifiers failing the allowlist are listed but never
+        interpolated into SQL (quote-escaping alone is not sufficient)."""
+        db_path = self.tmp / "hostile.db"
+        conn = sqlite3.connect(db_path)
+        # Identifier that survives naive quote-doubling tricks / fails allowlist
+        conn.execute('CREATE TABLE "weird""table" (id INTEGER)')
+        conn.execute('INSERT INTO "weird""table" VALUES (1)')
+        # Control: well-formed table must still be fully introspected
+        conn.execute("CREATE TABLE clean_table (id INTEGER PRIMARY KEY, note TEXT)")
+        conn.executemany("INSERT INTO clean_table VALUES (?,?)", [(1, "ok")])
+        conn.commit()
+        conn.close()
+        code, out, err = run_engine(db_path)
+        self.assertOk(code, err)
+        # Hostile object listed...
+        self.assertIn("weird\"table", out)
+        # ...but explicitly skipped, never sampled
+        self.assertIn("[skipped: identifier outside safe pattern]", out)
+        self.assertNotIn("## table: weird\"table (1 rows)", out)
+        # Clean table unaffected end-to-end
+        self.assertIn("## table: clean_table (1 rows)", out)
+        self.assertIn("ok", out)
+
     def test_ipynb_outputs_stripped_but_stdout_kept(self) -> None:
         nb = {
             "cells": [
