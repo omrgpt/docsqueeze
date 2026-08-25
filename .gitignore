@@ -5,3 +5,7 @@ __pycache__/
 dist/
 build/
 *.egg-info/
+# secrets never get committed (SEC-002)
+.env
+.env.*
+*.env
